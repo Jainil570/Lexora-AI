@@ -12,3 +12,5 @@ python-multipart==0.0.12
 passlib[bcrypt]==1.7.4
 pyjwt==2.12.1
 pymupdf==1.27.2.3
+langgraph>=0.2.0
+langchain-core>=0.3.0
