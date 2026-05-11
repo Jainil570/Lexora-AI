@@ -1,12 +1,13 @@
 """LangGraph-based conversational intake workflow.
 
-Implements a StateGraph with three core nodes:
-  1. analyze_state_node  — determines what data is still needed
-  2. ask_user_node       — uses the LLM to formulate the next question
-  3. generate_document_node — calls the existing document generators
+Implements a StateGraph with four core nodes:
+  1. analyze_state_node       — determines what data is still needed
+  2. ask_user_node             — uses the LLM to formulate the next question
+  3. retrieve_clauses_node     — RAG clause retrieval for grounding (NDA only)
+  4. generate_document_node    — calls the existing document generators
 
-The graph uses conditional edges to route between asking more questions
-and triggering document generation.
+The graph uses conditional edges to route between asking more questions,
+retrieving clauses, and triggering document generation.
 """
 import json
 import logging
@@ -33,6 +34,7 @@ from services.document_generator import (
     generate_esop, generate_vendor_contract, generate_employment_agreement,
 )
 from services.file_exporter import generate_docx, generate_pdf
+from services.clause_retriever import get_clause_retriever
 from utils.logger import log_event
 
 logger = logging.getLogger(__name__)
@@ -216,24 +218,103 @@ async def ask_user_node(state: AgentState) -> AgentState:
     return new_state
 
 
-async def generate_document_node(state: AgentState) -> AgentState:
-    """Generate the final legal document using the existing document generators.
+async def retrieve_clauses_node(state: AgentState) -> AgentState:
+    """Retrieve relevant legal clauses from the clause library for RAG grounding.
 
-    This node bridges the conversational state into the existing Pydantic
-    LegalState models and calls the appropriate generation function.
+    This node fires before generate_document_node for NDA documents.
+    It queries ChromaDB for semantically relevant clauses and stores
+    the grounding context in the state.
     """
     doc_type = state.get("document_type")
     collected = state.get("collected_fields", {})
     session_id = state.get("session_id", "unknown")
 
+    # Only retrieve for NDA documents (other types don't have clause libraries yet)
+    if doc_type != "nda":
+        logger.info(f"Skipping clause retrieval for {doc_type} (no clause library)")
+        return {**state, "retrieved_clauses": "", "retrieved_clause_ids": []}
+
+    try:
+        retriever = get_clause_retriever()
+
+        # Extract NDA-specific params from collected fields
+        nda_type = collected.get("nda_type", "mutual")
+        startup_stage = collected.get("startup_stage", "seed")
+        jurisdiction = collected.get("jurisdiction_state", "")
+        purpose = collected.get("purpose", "")
+
+        result = await retriever.retrieve_for_nda(
+            nda_type=nda_type,
+            startup_stage=startup_stage,
+            jurisdiction=jurisdiction,
+            purpose=purpose,
+            session_id=session_id,
+        )
+
+        grounding_context = retriever.build_grounding_context(result.clauses)
+
+        await log_event(
+            event_type="rag_grounding_prepared",
+            session_id=session_id,
+            data={
+                "clause_ids": result.clause_ids,
+                "clause_types_covered": result.clause_types_covered,
+                "grounding_context_length": len(grounding_context),
+                "total_retrieved": result.total_retrieved,
+            },
+        )
+
+        logger.info(
+            f"RAG grounding: {result.total_retrieved} clauses, "
+            f"{len(result.clause_types_covered)} types, "
+            f"{len(grounding_context)} chars"
+        )
+
+        return {
+            **state,
+            "retrieved_clauses": grounding_context,
+            "retrieved_clause_ids": result.clause_ids,
+        }
+
+    except Exception as e:
+        logger.error(f"Clause retrieval failed: {e}")
+        await log_event(
+            event_type="clause_retrieval_failed",
+            session_id=session_id,
+            error=str(e),
+        )
+        # Graceful degradation: continue without grounding
+        return {**state, "retrieved_clauses": "", "retrieved_clause_ids": []}
+
+
+async def generate_document_node(state: AgentState) -> AgentState:
+    """Generate the final legal document using the existing document generators.
+
+    This node bridges the conversational state into the existing Pydantic
+    LegalState models and calls the appropriate generation function.
+    If retrieved clauses are available, they are passed as grounding context.
+    """
+    doc_type = state.get("document_type")
+    collected = state.get("collected_fields", {})
+    session_id = state.get("session_id", "unknown")
+    grounding_context = state.get("retrieved_clauses", "")
+    retrieved_ids = state.get("retrieved_clause_ids", [])
+
     await log_event(
         event_type="chat_generation_started",
         session_id=session_id,
-        data={"document_type": doc_type, "collected_fields": collected},
+        data={
+            "document_type": doc_type,
+            "collected_fields": collected,
+            "has_grounding": bool(grounding_context),
+            "retrieved_clause_ids": retrieved_ids,
+        },
     )
 
     try:
-        generated_text = await _dispatch_generation(doc_type, collected)
+        generated_text = await _dispatch_generation(
+            doc_type, collected, grounding_context
+        )
     except Exception as e:
         logger.error(f"Document generation failed: {e}")
         await log_event(
@@ -274,15 +355,21 @@ async def generate_document_node(state: AgentState) -> AgentState:
             "text_length": len(generated_text),
             "docx_path": docx_path,
             "pdf_path": pdf_path,
+            "used_rag_grounding": bool(grounding_context),
+            "retrieved_clause_ids": retrieved_ids,
         },
     )
 
     # Add completion message to history
     label = DOCUMENT_TYPE_LABELS.get(doc_type, doc_type)
+    rag_note = " (grounded with retrieved legal clauses)" if grounding_context else ""
     history = list(state.get("conversation_history", []))
     history.append(ChatMessage(
         role="assistant",
-        content=f"Your {label} has been generated successfully! You can preview it below and download it as PDF or DOCX.",
+        content=(
+            f"Your {label} has been generated successfully{rag_note}! "
+            f"You can preview it below and download it as PDF or DOCX."
+        ),
     ))
 
     return {
@@ -295,10 +382,15 @@ async def generate_document_node(state: AgentState) -> AgentState:
     }
 
 
-async def _dispatch_generation(doc_type: str, fields: Dict[str, Any]) -> str:
+async def _dispatch_generation(
+    doc_type: str, fields: Dict[str, Any], grounding_context: str = ""
+) -> str:
     """Route to the correct document generator based on document type."""
+    if doc_type == "nda":
+        legal_state = NDALegalState(**fields)
+        return await generate_nda(legal_state, grounding_context=grounding_context)
+
     generators = {
-        "nda": (NDALegalState, generate_nda),
         "founder_agreement": (FounderAgreementLegalState, generate_founder_agreement),
         "esop": (ESOPLegalState, generate_esop),
         "vendor_contract": (VendorContractLegalState, generate_vendor_contract),
@@ -318,7 +410,7 @@ async def _dispatch_generation(doc_type: str, fields: Dict[str, Any]) -> str:
 def _should_generate(state: AgentState) -> str:
     """Conditional edge: decide whether to generate or keep asking."""
     if state.get("status") == "ready_to_generate":
-        return "generate"
+        return "retrieve"
     return "ask"
 
 
@@ -326,7 +418,8 @@ def build_intake_graph() -> StateGraph:
     """Build and compile the LangGraph intake workflow.
 
     Graph flow:
-        analyze_state → (conditional) → ask_user OR generate_document
+        analyze_state → (conditional) → ask_user OR retrieve_clauses
+        retrieve_clauses → generate_document
         ask_user → END (returns to user for next message)
         generate_document → END (returns completed document)
     """
@@ -335,6 +428,7 @@ def build_intake_graph() -> StateGraph:
     # Add nodes
     graph.add_node("analyze_state", analyze_state_node)
     graph.add_node("ask_user", ask_user_node)
+    graph.add_node("retrieve_clauses", retrieve_clauses_node)
     graph.add_node("generate_document", generate_document_node)
 
     # Set entry point
@@ -346,12 +440,14 @@ def build_intake_graph() -> StateGraph:
         _should_generate,
         {
             "ask": "ask_user",
-            "generate": "generate_document",
+            "retrieve": "retrieve_clauses",
         },
     )
 
+    # Retrieve clauses → then generate
+    graph.add_edge("retrieve_clauses", "generate_document")
+
     # Both ask_user and generate_document terminate the current graph run
-    # (the user will send another message to continue the conversation)
     graph.add_edge("ask_user", END)
     graph.add_edge("generate_document", END)
 

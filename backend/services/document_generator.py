@@ -22,12 +22,16 @@ def _load_prompt(filename: str) -> str:
     return prompt_path.read_text(encoding="utf-8")
 
 
-def _build_nda_user_prompt(state: NDALegalState) -> str:
-    """Build the user prompt from the NDA legal state."""
+def _build_nda_user_prompt(state: NDALegalState, grounding_context: str = "") -> str:
+    """Build the user prompt from the NDA legal state.
+
+    If grounding_context is provided (from RAG retrieval), it is prepended
+    to instruct the LLM to use retrieved clauses as the legal foundation.
+    """
     nda_type_label = "Mutual" if state.nda_type.value == "mutual" else "One-Way"
     stage_label = state.startup_stage.value.replace("_", " ").title()
 
-    return f"""Generate a {nda_type_label} Non-Disclosure Agreement with the following details:
+    base_prompt = f"""Generate a {nda_type_label} Non-Disclosure Agreement with the following details:
 
 - Disclosing Party: {state.disclosing_party}
 - Receiving Party: {state.receiving_party}
@@ -36,9 +40,21 @@ def _build_nda_user_prompt(state: NDALegalState) -> str:
 - Confidentiality Duration: {state.confidentiality_duration_years} year(s)
 - Jurisdiction: {state.jurisdiction_state}, India
 - Startup Stage: {stage_label}
-- Governing Law: Laws of India, with courts in {state.jurisdiction_state} having exclusive jurisdiction
+- Governing Law: Laws of India, with courts in {state.jurisdiction_state} having exclusive jurisdiction"""
+
+    if grounding_context:
+        return f"""{grounding_context}
+
+{base_prompt}
+
+IMPORTANT: Use the REFERENCE LEGAL CLAUSES above as your primary legal foundation.
+Adapt and customize each clause for the specific parties, jurisdiction, and purpose described.
+Do NOT invent new legal structures — build from the retrieved reference clauses.
+Ensure all clauses are adapted for Indian jurisdiction and the specified governing law.
 
 Generate the complete NDA document now."""
+    else:
+        return base_prompt + "\n\nGenerate the complete NDA document now."
 
 
 def _build_founder_agreement_user_prompt(state: FounderAgreementLegalState) -> str:
@@ -77,8 +93,13 @@ KEY TERMS:
 Generate the complete Founder Agreement document now."""
 
 
-async def generate_nda(state: NDALegalState) -> str:
-    """Generate an NDA document from the validated legal state."""
+async def generate_nda(state: NDALegalState, grounding_context: str = "") -> str:
+    """Generate an NDA document from the validated legal state.
+
+    Args:
+        state: Validated NDA legal state.
+        grounding_context: Optional RAG-retrieved clause context for grounding.
+    """
     await log_event(
         event_type="generation_started",
         session_id=state.session_id,
@@ -87,13 +108,14 @@ async def generate_nda(state: NDALegalState) -> str:
             "nda_type": state.nda_type.value,
             "startup_stage": state.startup_stage.value,
             "jurisdiction": state.jurisdiction_state,
+            "has_grounding": bool(grounding_context),
         },
         prompt_id="nda_generation",
     )
 
     try:
         system_prompt = _load_prompt("nda_generation.txt")
-        user_prompt = _build_nda_user_prompt(state)
+        user_prompt = _build_nda_user_prompt(state, grounding_context)
 
         provider = get_llm_provider()
         generated_text = await provider.generate(
@@ -105,7 +127,11 @@ async def generate_nda(state: NDALegalState) -> str:
         await log_event(
             event_type="generation_completed",
             session_id=state.session_id,
-            data={"document_type": "nda", "text_length": len(generated_text)},
+            data={
+                "document_type": "nda",
+                "text_length": len(generated_text),
+                "used_rag_grounding": bool(grounding_context),
+            },
             prompt_id="nda_generation",
         )
 

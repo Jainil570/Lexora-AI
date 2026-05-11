@@ -171,6 +171,7 @@ class AgentState(TypedDict, total=False):
         "awaiting_document_type",   # Haven't determined document type yet
         "collecting_fields",        # Actively asking questions
         "ready_to_generate",        # All fields collected, about to generate
+        "retrieving_clauses",       # RAG clause retrieval in progress
         "generating",               # Document generation in progress
         "completed",                # Document generated successfully
         "error",                    # An error occurred
@@ -178,6 +179,8 @@ class AgentState(TypedDict, total=False):
     generated_text: Optional[str]
     docx_download_url: Optional[str]
     pdf_download_url: Optional[str]
+    retrieved_clauses: Optional[str]
+    retrieved_clause_ids: Optional[List[str]]
     error: Optional[str]
 
 
@@ -193,5 +196,7 @@ def create_initial_state(session_id: Optional[str] = None) -> AgentState:
         generated_text=None,
         docx_download_url=None,
         pdf_download_url=None,
+        retrieved_clauses=None,
+        retrieved_clause_ids=None,
         error=None,
     )

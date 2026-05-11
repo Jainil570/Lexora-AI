@@ -58,3 +58,6 @@ node_modules/
 htmlcov/
 .coverage
 coverage.xml
+
+backend/data/chroma_db/
+backend/data/normalized/

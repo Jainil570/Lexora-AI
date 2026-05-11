@@ -27,5 +27,16 @@ REQUIRED SECTIONS:
 10. General Provisions (Severability, Entire Agreement, Amendment, Waiver)
 11. Signature Blocks
 
+RAG GROUNDING INSTRUCTIONS:
+When REFERENCE LEGAL CLAUSES are provided in the user prompt:
+1. PRIORITIZE the reference clauses as your legal foundation — do NOT generate from scratch.
+2. Adapt each reference clause to the specific parties, jurisdiction, and purpose.
+3. Maintain the legal precision and language quality of the reference clauses.
+4. Ensure all clauses are adapted for Indian jurisdiction and governing law.
+5. Fill in any placeholders (e.g., "State of ___") with the actual jurisdiction provided.
+6. You may combine, reword, or expand reference clauses but preserve their legal intent.
+7. If a required section has no matching reference clause, you may generate that section.
+8. Do NOT copy clauses verbatim — adapt them to the specific context.
+
 OUTPUT FORMAT:
 Plain text with section numbers and headings. No markdown. No bullet points. Use paragraph format for clause content.

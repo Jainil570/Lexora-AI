@@ -53,9 +53,29 @@ async def generate_document(
         data={"document_type": "nda", "request": request.model_dump(), "user_id": user_id},
     )
 
+    # Retrieve clauses for RAG grounding
+    grounding_context = ""
+    try:
+        from services.clause_retriever import get_clause_retriever
+        retriever = get_clause_retriever()
+        result = await retriever.retrieve_for_nda(
+            nda_type=legal_state.nda_type.value,
+            startup_stage=legal_state.startup_stage.value,
+            jurisdiction=legal_state.jurisdiction_state,
+            purpose=legal_state.purpose,
+            session_id=legal_state.session_id,
+        )
+        grounding_context = retriever.build_grounding_context(result.clauses)
+        logger.info(
+            f"RAG: Retrieved {result.total_retrieved} clauses for NDA generation "
+            f"({len(result.clause_types_covered)} types)"
+        )
+    except Exception as e:
+        logger.warning(f"Clause retrieval failed, proceeding without RAG: {e}")
+
     # Generate document text via LLM
     try:
-        generated_text = await generate_nda(legal_state)
+        generated_text = await generate_nda(legal_state, grounding_context=grounding_context)
     except RuntimeError as e:
         logger.error(f"LLM generation failed: {e}")
         await log_event(
